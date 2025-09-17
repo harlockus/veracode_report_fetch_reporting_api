@@ -1,5 +1,3 @@
-Here’s the entire README.md you can copy straight into your repo. Just open your editor, paste it all in, save as README.md, and push to GitHub — it will render perfectly.
-
 # Veracode Reporting API – Full Fetcher (HTTPie + HMAC)
 
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
@@ -40,6 +38,7 @@ pip install pandas openpyxl xlsxwriter
 
 Or skip Excel with --no-xlsx.
 
+Or simply pip install -r requirements.txt
 ⸻
 
 🔐 Authentication
