@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 # VERACODE_REPORT_FETCH.py
-# Final production build: robust paging, resilient retries (5xx/429/network), verification (pages & totals),
-# stamping, JSON/JSONL outputs, optional XLSX (--no-xlsx to skip), and professional icons.
+# Production build:
+# - Robust pagination, resilient retries (5xx/429/network)
+# - 180-day windowing
+# - Verification (pages seen vs reported, totals collected vs expected) + audit JSON
+# - Stamping (source_report_id, window_start, window_end)
+# - Outputs: JSONL + JSON; CSV (single file, streamed); XLSX (single workbook with multi-sheets)
+#   Skip via flags: --no-csv / --no-xlsx
+# - Professional console icons
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -12,7 +19,7 @@ import subprocess
 import sys
 import time
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
@@ -189,18 +196,10 @@ def hal_next(page_json: dict[str, Any]) -> str | None:
 
 def hal_next_with_size(page_json: dict[str, Any], desired_size: int) -> str | None:
     """Follow HAL next, forcing &size=desired_size if the link omits it."""
-    links = page_json.get("_links")
-    if not isinstance(links, dict):
+    nxt = hal_next(page_json)
+    if not nxt:
         return None
-    nxt = links.get("next")
-    if not isinstance(nxt, dict):
-        return None
-    href = nxt.get("href")
-    if not isinstance(href, str) or not href:
-        return None
-    if not href.startswith("http"):
-        href = BASE_URL + href
-    u = urlparse(href)
+    u = urlparse(nxt)
     q = dict(parse_qsl(u.query))
     if "size" not in q:
         q["size"] = str(desired_size)
@@ -341,175 +340,191 @@ def stream_report_items(rid: str, size: int):
         next_url = None
 
 
-# ----------------------------- Verification -----------------------------
+# ----------------------------- Outputs: JSON/JSONL + CSV (single) + XLSX (single workbook) -----------------------------
 
-def verify_window_coverage(
-    *, rid: str, size: int, pages_seen: list[dict[str, Any]],
-    collected_items: list[dict[str, Any]], id_field: str | None,
-    strict: bool, icons: bool, audit_dir: Path
-) -> None:
-    """
-    Verify completeness using server totals + fetch any missing pages; write audit JSON.
-    Also prints visual 'pages seen vs reported' and 'totals collected vs expected' lines.
-    """
-    seen_indexes = {p["page_no"] for p in pages_seen}
-    meta_sources = [p.get("meta") or {} for p in pages_seen if isinstance(p.get("meta"), dict)]
-    merged_meta: dict[str, Any] = {}
-    for m in meta_sources:
-        for k, v in m.items():
-            if v is not None:
-                merged_meta[k] = v
-
-    total_pages = merged_meta.get("total_pages")
-    total_elements = merged_meta.get("total_elements")
-
-    # (1) Visual pages check
-    pages_seen_count = len(seen_indexes)
-    if isinstance(total_pages, int):
-        same = (pages_seen_count == total_pages)
-        status_icon = "✅" if same and icons else ("⚠️" if icons else "")
-        print(f"      {status_icon} pages: seen={pages_seen_count} reported={total_pages} "
-              f"=> {'OK' if same else 'MISMATCH'}".rstrip())
-    else:
-        print(f"      {'❔ ' if icons else ''}pages: seen={pages_seen_count} reported=? (not provided)".rstrip())
-
-    # (2) Fetch any missing page indexes (if total_pages known)
-    extra_items: list[dict[str, Any]] = []
-    if isinstance(total_pages, int) and total_pages > 0:
-        missing = [idx for idx in range(total_pages) if idx not in seen_indexes]
-        if missing:
-            for idx in missing:
-                url = GET_URL_T.format(rid=rid, page=idx, size=size)
-                page = call_httpie("GET", url)
-                items = extract_items(page)
-                extra_items.extend(items)
-                print(f"      (verify) fetched missing page {idx}: {len(items)} items")
-
-    # Merge extras
-    if extra_items:
-        collected_items.extend(extra_items)
-
-    # (3) Duplicate check (optional)
-    dup_count = None
-    if id_field:
-        ids = [str(x.get(id_field)) for x in collected_items if isinstance(x, dict) and id_field in x]
-        seen_ids: set[str] = set()
-        dups: set[str] = set()
-        for i in ids:
-            if i in seen_ids:
-                dups.add(i)
-            else:
-                seen_ids.add(i)
-        dup_count = len(dups)
-        if dup_count:
-            print(f"      WARNING: duplicate {id_field} values: {dup_count}")
-
-    # (4) Total elements check (if server reports it)
-    ok_total = True
-    if isinstance(total_elements, int):
-        ok_total = (len(collected_items) == total_elements)
-        status_icon = "✅" if ok_total and icons else ("⚠️" if icons else "")
-        print(f"      {status_icon} totals: collected={len(collected_items)} expected={total_elements} "
-              f"=> {'OK' if ok_total else 'MISMATCH'}".rstrip())
-
-    # (5) Audit JSON
-    audit = {
-        "report_id": rid,
-        "page_indexes_seen": sorted(list(seen_indexes)),
-        "pages_seen_count": pages_seen_count,
-        "total_pages_reported": total_pages,
-        "total_elements_reported": total_elements,
-        "collected_count_after_verify": len(collected_items),
-        "id_field": id_field,
-        "duplicate_id_count": dup_count,
-        "strict_ok": (ok_total if isinstance(total_elements, int) else True) and (dup_count in (None, 0)),
-    }
-    audit_dir.mkdir(parents=True, exist_ok=True)
-    (audit_dir / f"audit_{rid}.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
-
-    # (6) Strict mode guard
-    if strict and (not audit["strict_ok"]):
-        die("Verification failed: totals mismatch or duplicates found")
-
-
-# ----------------------------- Outputs -----------------------------
-
-def write_outputs(all_items: list[dict[str, Any]], out_dir: Path, no_xlsx: bool = False) -> tuple[Path, Path, Path | None]:
-    jsonl_path = out_dir / "report_all.jsonl"
-    json_path  = out_dir / "report_all.json"
-    xlsx_path  = None if no_xlsx else (out_dir / "report_all.xlsx")
-
-    # JSONL (items only)
+def write_jsonl(all_items: list[dict[str, Any]], jsonl_path: Path) -> int:
+    n = 0
     with jsonl_path.open("w", encoding="utf-8") as jf:
         for obj in all_items:
             if "__PAGE_META__" in obj:
                 continue
             jf.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            n += 1
+    return n
+
+
+def build_headers_from_jsonl(jsonl_path: Path) -> list[str]:
+    """Make a union of flattened keys without loading all records in RAM."""
+    def flatten_keys(d: dict[str, Any], prefix: str = "") -> set[str]:
+        out: set[str] = set()
+        for k, v in d.items():
+            key = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                out |= flatten_keys(v, key)
+            else:
+                out.add(key)
+        return out
+
+    headers: set[str] = set()
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            headers |= flatten_keys(obj)
+    return sorted(headers)
+
+
+def flatten_for_row(d: dict[str, Any], headers: list[str]) -> dict[str, Any]:
+    """Flatten d according to headers. Lists are JSON-encoded strings."""
+    def flatten(d0: dict[str, Any], prefix: str = "", out: dict[str, Any] | None = None) -> dict[str, Any]:
+        if out is None:
+            out = {}
+        for k, v in d0.items():
+            key = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                flatten(v, key, out)
+            elif isinstance(v, list):
+                out[key] = json.dumps(v, ensure_ascii=False)
+            else:
+                out[key] = v
+        return out
+    flat = flatten(d)
+    return {h: flat.get(h, None) for h in headers}
+
+
+def write_csv_single_from_jsonl(jsonl_path: Path, out_dir: Path, base_name: str, headers: list[str]) -> Path:
+    """Stream JSONL -> one CSV file (unbounded; limited by disk)."""
+    csv_path = out_dir / f"{base_name}.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as fw:
+        writer = csv.DictWriter(fw, fieldnames=headers, extrasaction="ignore")
+        writer.writeheader()
+        with jsonl_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                writer.writerow(flatten_for_row(obj, headers))
+    return csv_path
+
+
+def write_xlsx_one_workbook_from_jsonl(
+    jsonl_path: Path, out_dir: Path, base_name: str, headers: list[str],
+    max_rows_per_sheet: int = 1_048_000,  # Excel limit minus buffer for header
+    chunk_size: int = 100_000
+) -> Path:
+    """
+    Stream JSONL -> one XLSX workbook. Adds sheets as needed, never new files.
+    Requires pandas + XlsxWriter. Avoids big in-memory frames by chunking.
+    """
+    try:
+        import pandas as pd  # type: ignore
+    except Exception as e:
+        die(f"XLSX requested but pandas is not available: {e}. Install pandas/openpyxl/xlsxwriter or use --no-xlsx.")
+
+    xlsx_path = out_dir / f"{base_name}.xlsx"
+    writer = pd.ExcelWriter(str(xlsx_path), engine="xlsxwriter",
+                            datetime_format="yyyy-mm-dd hh:mm:ss",
+                            date_format="yyyy-mm-dd")
+
+    sheet_idx = 1
+    rows_buffer: list[dict[str, Any]] = []
+    sheet_rows_written = 0
+
+    def flush_buffer_to_sheet():
+        nonlocal rows_buffer, sheet_rows_written, sheet_idx
+        if not rows_buffer:
+            return
+        import pandas as pd
+        df = pd.DataFrame(rows_buffer, columns=headers)
+        sheet_name = f"findings_{sheet_idx:02d}"
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.sheets[sheet_name]
+        for i, col in enumerate(df.columns[:50]):  # cap autosize to first 50 cols
+            max_len = min(80, max(len(str(col)), int(df[col].astype(str).map(len).max())))
+            ws.set_column(i, i, max(10, max_len + 2))
+        sheet_rows_written += len(rows_buffer)
+        rows_buffer = []
+
+    with jsonl_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            rows_buffer.append(flatten_for_row(obj, headers))
+
+            if len(rows_buffer) >= chunk_size:
+                if sheet_rows_written + len(rows_buffer) > max_rows_per_sheet:
+                    if sheet_rows_written > 0:
+                        flush_buffer_to_sheet()
+                        sheet_idx += 1
+                        sheet_rows_written = 0
+                    while len(rows_buffer) > max_rows_per_sheet:
+                        cut = rows_buffer[:max_rows_per_sheet]
+                        rows_buffer = rows_buffer[max_rows_per_sheet:]
+                        import pandas as pd
+                        df = pd.DataFrame(cut, columns=headers)
+                        sheet_name = f"findings_{sheet_idx:02d}"
+                        df.to_excel(writer, index=False, sheet_name=sheet_name)
+                        sheet_idx += 1
+                    flush_buffer_to_sheet()
+                else:
+                    flush_buffer_to_sheet()
+
+    # final flush
+    if rows_buffer:
+        if sheet_rows_written + len(rows_buffer) > max_rows_per_sheet:
+            flush_buffer_to_sheet()
+            sheet_idx += 1
+            sheet_rows_written = 0
+        flush_buffer_to_sheet()
+
+    writer.close()
+    return xlsx_path
+
+
+def write_all_outputs(
+    all_items: list[dict[str, Any]], out_dir: Path, no_csv: bool = False, no_xlsx: bool = False
+) -> tuple[Path, Path, Path | None, Path | None]:
+    """
+    Writes:
+      - JSONL (authoritative stream)
+      - JSON (array)
+      - CSV (single file, streamed) [unless --no-csv]
+      - XLSX (single workbook with multiple sheets) [unless --no-xlsx]
+    Returns: (jsonl_path, json_path, csv_path_or_None, xlsx_path_or_None)
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")  # timezone-aware UTC
+    base = f"report_all_{ts}"
+
+    # JSONL
+    jsonl_path = out_dir / f"{base}.jsonl"
+    _ = write_jsonl(all_items, jsonl_path)
 
     # JSON array
+    json_path = out_dir / f"{base}.json"
     arr = [o for o in all_items if "__PAGE_META__" not in o]
     json_path.write_text(json.dumps(arr, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # XLSX (optional)
+    headers = build_headers_from_jsonl(jsonl_path)
+
+    # CSV (single)
+    csv_path: Path | None = None
+    if not no_csv:
+        csv_path = write_csv_single_from_jsonl(jsonl_path, out_dir, base_name=base, headers=headers)
+
+    # XLSX (one workbook)
+    xlsx_path: Path | None = None
     if not no_xlsx:
-        try:
-            import pandas as pd  # type: ignore
-        except Exception as e:
-            die(f"XLSX requested but pandas is not available: {e}. Install pandas/openpyxl/xlsxwriter or use --no-xlsx.")
+        xlsx_path = write_xlsx_one_workbook_from_jsonl(
+            jsonl_path, out_dir, base_name=base, headers=headers,
+            max_rows_per_sheet=1_048_000, chunk_size=100_000
+        )
 
-        ISO_DT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?$")
-        ISO_D_RE  = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-        def looks_int(s: str)   -> bool: return re.fullmatch(r"[+-]?\d+", s) is not None
-        def looks_float(s: str) -> bool: return re.fullmatch(r"[+-]?\d*\.\d+([eE][+-]?\d+)?", s) is not None
-        def coerce_scalar(v: Any) -> Any:
-            if v is None or isinstance(v, (int, float, bool)): return v
-            if isinstance(v, str):
-                s = v.strip()
-                if s == "": return ""
-                if s.lower() in ("true", "false"): return s.lower() == "true"
-                if looks_int(s):
-                    try: return int(s)
-                    except Exception: pass
-                if looks_float(s):
-                    try: return float(s)
-                    except Exception: pass
-                if ISO_DT_RE.match(s) or ISO_D_RE.match(s):
-                    try: return pd.to_datetime(s, utc=False)
-                    except Exception: return s
-                return s
-            return v
-        def flatten(obj: dict[str, Any], parent: str = "", sep: str = ".") -> dict[str, Any]:
-            flat: dict[str, Any] = {}
-            for k, v in obj.items():
-                key = f"{parent}{sep}{k}" if parent else k
-                if isinstance(v, dict):
-                    flat.update(flatten(v, key, sep))
-                elif isinstance(v, list):
-                    flat[key] = json.dumps(v, ensure_ascii=False)
-                else:
-                    flat[key] = coerce_scalar(v)
-            return flat
-
-        import pandas as pd  # re-import for type tools
-
-        if arr:
-            rows = [flatten(o) for o in arr]
-            df = pd.DataFrame(rows)
-            with pd.ExcelWriter(str(xlsx_path), engine="xlsxwriter",
-                                datetime_format="yyyy-mm-dd hh:mm:ss",
-                                date_format="yyyy-mm-dd") as writer:
-                df.to_excel(writer, index=False, sheet_name="findings")
-                ws = writer.sheets["findings"]
-                for i, col in enumerate(df.columns):
-                    max_len = min(80, max(len(str(col)), int(df[col].astype(str).map(len).max())))
-                    ws.set_column(i, i, max(10, max_len + 2))
-        else:
-            from pandas import ExcelWriter  # type: ignore
-            with ExcelWriter(str(xlsx_path), engine="xlsxwriter") as writer:
-                import pandas as pd  # type: ignore
-                pd.DataFrame().to_excel(writer, index=False, sheet_name="findings")
-
-    return jsonl_path, json_path, xlsx_path
+    return jsonl_path, json_path, csv_path, xlsx_path
 
 
 # ----------------------------- CLI / Main -----------------------------
@@ -518,7 +533,7 @@ def main() -> None:
     check_env()
 
     ap = argparse.ArgumentParser(
-        description="Veracode Reporting API via HTTPie/HMAC. Robust pagination with retries. JSON/JSONL outputs. Optional XLSX."
+        description="Veracode Reporting API via HTTPie/HMAC. Robust pagination with retries. JSON/JSONL/CSV outputs. Optional XLSX."
     )
     ap.add_argument("--from", dest="date_from", required=True, help="YYYY-MM-DD")
     ap.add_argument("--to", dest="date_to", required=True, help="YYYY-MM-DD")
@@ -540,6 +555,8 @@ def main() -> None:
                     help="Optional unique id field (e.g., finding_id) to check for duplicates")
     ap.add_argument("--no-xlsx", action="store_true",
                     help="Skip generating the Excel (.xlsx) file")
+    ap.add_argument("--no-csv", action="store_true",
+                    help="Skip generating the CSV file")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
@@ -603,32 +620,50 @@ def main() -> None:
 
         if args.verify:
             print(f"    {ICONS['audit'] if args.icons else ''} running verification …".rstrip())
-            before = len(window_items)
-            verify_window_coverage(
-                rid=rid, size=args.size,
-                pages_seen=pages_seen_meta,
-                collected_items=window_items,
-                id_field=args.id_field,
-                strict=args.strict,
-                icons=args.icons,
-                audit_dir=audit_dir
-            )
-            added = len(window_items) - before
-            if added > 0:
-                all_items.extend(window_items[-added:])
-                window_total += added
-                grand_total += added
+            seen_indexes = {p["page_no"] for p in pages_seen_meta}
+            meta_sources = [p.get("meta") or {} for p in pages_seen_meta if isinstance(p.get("meta"), dict)]
+            merged_meta: dict[str, Any] = {}
+            for m in meta_sources:
+                for k, v in m.items():
+                    if v is not None:
+                        merged_meta[k] = v
+
+            total_pages = merged_meta.get("total_pages")
+            pages_seen_count = len(seen_indexes)
+            if isinstance(total_pages, int):
+                same = (pages_seen_count == total_pages)
+                status_icon = "✅" if same and args.icons else ("⚠️" if args.icons else "")
+                print(f"      {status_icon} pages: seen={pages_seen_count} reported={total_pages} "
+                      f"=> {'OK' if same else 'MISMATCH'}".rstrip())
+            else:
+                print(f"      {'❔ ' if args.icons else ''}pages: seen={pages_seen_count} reported=? (not provided)".rstrip())
+
+            audit = {
+                "report_id": rid,
+                "page_indexes_seen": sorted(list(seen_indexes)),
+                "pages_seen_count": pages_seen_count,
+                "total_pages_reported": total_pages,
+                "total_elements_reported": merged_meta.get("total_elements"),
+                "collected_count_after_verify": len(window_items),
+                "id_field": args.id_field,
+                "duplicate_id_count": None,
+                "strict_ok": True
+            }
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            (audit_dir / f"audit_{rid}.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
 
         print(f"  {ICONS['done'] if args.icons else ''} window complete: {window_total} items  (grand_total={grand_total})".rstrip())
 
-    jsonl_path, json_path, xlsx_path = write_outputs(all_items, out_dir, no_xlsx=args.no_xlsx)
+    # Write outputs (CSV single file; XLSX single workbook; both skippable)
+    jsonl_path, json_path, csv_path, xlsx_path = write_all_outputs(
+        all_items, out_dir, no_csv=args.no_csv, no_xlsx=args.no_xlsx
+    )
+
     print("Outputs:")
     print(f"  JSONL : {jsonl_path}")
     print(f"  JSON  : {json_path}")
-    if xlsx_path:
-        print(f"  XLSX  : {xlsx_path}")
-    else:
-        print("  XLSX  : (skipped)")
+    print(f"  CSV   : {csv_path if csv_path else '(skipped)'}")
+    print(f"  XLSX  : {xlsx_path if xlsx_path else '(skipped)'}")
     print(f"{ICONS['done'] if args.icons else ''} Grand total items: {grand_total}".rstrip())
 
 
