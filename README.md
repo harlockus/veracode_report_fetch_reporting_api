@@ -21,6 +21,8 @@ Production-ready CLI to export **all findings** from the Veracode Reporting REST
 - **Stamping** (default) → adds `source_report_id`, `window_start`, `window_end`
 - Outputs: JSONL + JSON + optional XLSX (skip with `--no-xlsx`)
 - Professional console icons (`--icons`)
+- Adjust dates as necessary
+- Gentler polling & longer timeout recommended
 
 ---
 
@@ -207,3 +209,6 @@ Outputs:
 📊 Grand total items: 10126
 
 ---
+
+Not a Veracode official tool
+Utilizing https://docs.veracode.com/r/Reporting_REST_API
