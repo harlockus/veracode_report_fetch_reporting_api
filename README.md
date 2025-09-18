@@ -23,9 +23,9 @@ Production-ready CLI to export **all findings** from the Veracode Reporting REST
 - **Outputs**
   - **JSONL** (lossless, one row per line)
   - **JSON** (array)
-  - **CSV** → **single file** (streamed; effectively unlimited rows)
-  - **XLSX** → **single workbook** (adds sheets as needed, never multiple files)
-- **Skip outputs** via flags: `--no-csv`, `--no-xlsx`
+  - **CSV** → **single file** (streamed; unlimited rows)
+  - **XLSX** → **single workbook** (multi-sheet if needed)
+- **Skip outputs** with `--no-csv` / `--no-xlsx`
 - **Professional console icons** (`--icons`)
 
 ---
@@ -37,213 +37,162 @@ Production-ready CLI to export **all findings** from the Veracode Reporting REST
   ```bash
   pip install httpie veracode-api-signing
 
-	•	For Excel export (optional):
+  For Excel export (optional):
+  pip install pandas openpyxl xlsxwriter
 
-pip install pandas openpyxl xlsxwriter
+  If you don’t need Excel, use --no-xlsx.
 
-If you don’t need Excel, use --no-xlsx (no pandas required).
+  🔐 Authentication
+  export VERACODE_API_KEY_ID=YOUR_KEY_ID
+  export VERACODE_API_KEY_SECRET=YOUR_KEY_SECRET
 
-⸻
+  Optional (macOS trust store):
+  export REQUESTS_CA_BUNDLE=$(python -m certifi)
 
-🔐 Authentication
-
-export VERACODE_API_KEY_ID=YOUR_KEY_ID
-export VERACODE_API_KEY_SECRET=YOUR_KEY_SECRET
-
-Optional (macOS trust store):
-
-export REQUESTS_CA_BUNDLE=$(python -m certifi)
-
-Avoid setting the legacy VERACODE_API_ID / VERACODE_API_KEY.
-
-⸻
-
-🚀 Quick Start
-
-python3 VERACODE_REPORT_FETCH.py \
+  🚀 Quick Start
+  python3 VERACODE_REPORT_FETCH.py \
   --from 2023-01-01 --to 2025-09-15 \
   --report-type FINDINGS \
   --size 200 \
   --out ./out \
   --icons --verify
 
-Outputs (in ./out):
-	•	report_all_YYYYMMDD_HHMMSS.jsonl
-	•	report_all_YYYYMMDD_HHMMSS.json
-	•	report_all_YYYYMMDD_HHMMSS.csv   (single file)
-	•	report_all_YYYYMMDD_HHMMSS.xlsx  (single workbook; multi-sheet if needed)
-	•	audit/audit_<report_id>.json  (one per window when --verify is used)
+  Outputs:
+	•	report_all_YYYYMMDD_HHMMSS.jsonl – line-delimited JSON
+	•	report_all_YYYYMMDD_HHMMSS.json – JSON array
+	•	report_all_YYYYMMDD_HHMMSS.csv – CSV (single file, unlimited rows)
+	•	report_all_YYYYMMDD_HHMMSS.xlsx – Excel (one workbook, multiple sheets if needed)
+	•	audit/audit_<report_id>.json – per-window audit files (when --verify is used)
+
+  ⚙️ CLI Options
+  --from YYYY-MM-DD       Start date (inclusive; 00:00:00 per window)
+  --to YYYY-MM-DD         End date (inclusive; 23:59:59 per window)
+  --report-type FINDINGS  Report type (default FINDINGS)
+  --size INT              Page size for GET (default 1000)
+  --out PATH              Output directory (default ./out)
+  --filters FILE|<(JSON)  JSON merged into POST body (e.g., status, severity, application_name)
+  --sleep FLOAT           Delay after POST before polling (default 0.5s)
+  --poll-interval FLOAT   Seconds between polls (default 2.0)
+  --poll-timeout INT      Max seconds to wait for COMPLETED (default 600)
+  --icons                 Show console icons
+  --no-stamp              Do not add source_report_id/window_start/window_end
+  --verify                Verify pages/totals; write audit JSON
+  --strict                With --verify, exit on mismatch/dupes
+  --id-field FIELD        Unique key for duplicate check (e.g., finding_id)
+  --no-xlsx               Skip Excel output
+  --no-csv                Skip CSV output
+
+	🎛️ Using Filters
+
+	You can narrow down the findings returned by the API by passing a JSON file with --filters.
+	These filters are merged into the POST body when creating the report.
+
+	Examples
+
+	Open-only findings
+	{
+ 	 "status": "open"
+	}
+
+	Closed findings for a specific application
+	{
+	 "status": "closed",
+ 	 "application_name": "Demo Web App"
+	}
+
+	High severity only
+	{
+  	 "severity": ["5 - Very High", "4 - High"]
+	}
+
+	Running with filters
+	python3 VERACODE_REPORT_FETCH.py \
+  	--from 2024-01-01 --to 2025-09-17 \
+  	--report-type FINDINGS \
+ 	--size 200 \
+  	--filters filters.json \
+  	--out ./out --icons --verify
+
+	💡 Tip: If you omit "status" from your filters, the API will return all findings (open + closed + mitigated).
+
+	🔍 Examples
+ 		python3 VERACODE_REPORT_FETCH.py \
+  		--from 2022-01-01 --to 2025-09-17 \
+  		--report-type FINDINGS --size 200 \
+ 		 --out ./out --icons --verify
+
+	Skip Excel, keep CSV:
+  		python3 VERACODE_REPORT_FETCH.py \
+		--from 2022-01-01 --to 2025-09-17 \
+  		--report-type FINDINGS --size 200 \
+  		--out ./out --icons --verify --no-xlsx
+
+  	JSON/JSONL only (no CSV, no XLSX):
+  		python3 VERACODE_REPORT_FETCH.py \
+  		--from 2022-01-01 --to 2025-09-17 \
+  		--report-type FINDINGS --size 200 \
+  		--out ./out --icons --verify --no-xlsx --no-csv
+
+  	Gentler polling & longer timeout (busy tenants):
+  		python3 VERACODE_REPORT_FETCH.py \
+  		--from 2022-01-01 --to 2025-09-17 \
+  		--report-type FINDINGS --size 200 \
+  		--poll-interval 3.0 --poll-timeout 1800 \
+  		--out ./out --icons --verify
+
+  		🧾 Verification & Audit
+
+		With --verify, per window you’ll see:
+			🧾 running verification …
+     		✅ pages: seen=7 reported=7 => OK
+			✅ totals: collected=3002 expected=3002 => OK
+
+   		Audit JSON (./out/audit/audit_<report_id>.json) includes:
+		•	Page indexes seen and API total_pages
+		•	API-reported total_elements vs collected
+		•	Duplicate count (if --id-field is set)
+
+		🔁 Resilient Retries
+		•	Retries up to 7 attempts on 5xx / 429 / network errors
+		•	Exponential backoff + jitter
+		•	Honors Retry-After header on 429
+		•	Retries partial JSON decode errors
+		•	Fails fast on 401 Unauthorized
+
+		Tuning tips:
+		•	Large datasets: --size 200..500, --poll-interval 3..5, --poll-timeout 1800..3600
 
 ⸻
 
-⚙️ CLI Options
-
---from YYYY-MM-DD       Start date (inclusive; 00:00:00 per window)
---to YYYY-MM-DD         End date (inclusive; 23:59:59 per window)
---report-type FINDINGS  Report type (default FINDINGS)
---size INT              Page size for GET (default 1000)
---out PATH              Output directory (default ./out)
---filters FILE|<(JSON)  JSON merged into POST body (e.g., status, severity, application_name)
---sleep FLOAT           Delay after POST before polling (default 0.5s)
---poll-interval FLOAT   Seconds between status polls (default 2.0)
---poll-timeout INT      Max seconds to wait for COMPLETED (default 600)
---icons                 Show console icons
---no-stamp              Do not add source_report_id/window_start/window_end
---verify                Verify pages/totals; write audit JSON
---strict                With --verify, exit on mismatch/dupes
---id-field FIELD        Unique key for duplicate check (e.g., finding_id)
---no-xlsx               Skip Excel output
---no-csv                Skip CSV output
-
-Filters (POST body)
-
-Provide a JSON file with constraints (omit status to include all statuses: open + closed + mitigated):
-
-{
-  "status": "open",
-  "policy_name": "Corporate Security Policy",
-  "severity": ["5 - Very High", "4 - High"],
-  "application_name": "Demo Web App"
-}
-
-Use with:
-
---filters filters.json
-
-Or inline (bash/zsh):
-
---filters <(cat <<'JSON'
-{ "status": "open", "severity": ["5 - Very High", "4 - High"] }
-JSON
-)
+		📄 Output Details
+		•	JSONL – Source of truth; easiest to pipe/stream
+		•	JSON – Pretty-printed array
+		•	CSV – One file, flattened; lists encoded as JSON strings in cells
+		•	XLSX – One workbook; adds sheets when row cap reached (~1,048,576 per sheet)
 
 
-⸻
-
-🔍 Examples
-
-All outputs (single CSV + single XLSX workbook):
-
-python3 VERACODE_REPORT_FETCH.py \
-  --from 2022-01-01 --to 2025-09-17 \
-  --report-type FINDINGS --size 200 \
-  --out ./out --icons --verify
-
-Skip Excel, keep CSV:
-
-python3 VERACODE_REPORT_FETCH.py \
-  --from 2022-01-01 --to 2025-09-17 \
-  --report-type FINDINGS --size 200 \
-  --out ./out --icons --verify --no-xlsx
-
-JSON/JSONL only (no CSV, no XLSX):
-
-python3 VERACODE_REPORT_FETCH.py \
-  --from 2022-01-01 --to 2025-09-17 \
-  --report-type FINDINGS --size 200 \
-  --out ./out --icons --verify --no-xlsx --no-csv
-
-Gentler polling & longer timeout (busy tenants):
-
-python3 VERACODE_REPORT_FETCH.py \
-  --from 2022-01-01 --to 2025-09-17 \
-  --report-type FINDINGS --size 200 \
-  --poll-interval 3.0 --poll-timeout 1800 \
-  --out ./out --icons --verify
-
-Open-only findings (filters):
-
-python3 VERACODE_REPORT_FETCH.py \
-  --from 2024-01-01 --to 2025-09-15 \
-  --report-type FINDINGS --size 500 \
-  --filters filters.json \
-  --out ./out_open --icons --verify
-
-
-⸻
-
-🧾 Verification & Audit
-
-With --verify, per window you’ll see:
-
-🧾 running verification …
-      ✅ pages: seen=7 reported=7 => OK
-      ✅ totals: collected=3002 expected=3002 => OK
-
-An audit file is written to ./out/audit/audit_<report_id>.json summarizing:
-	•	Page indexes seen and the API’s total_pages
-	•	API-reported total_elements (when present) vs collected
-	•	Duplicate count when --id-field is set
-
-Use --strict to fail the run on mismatches/duplicates.
-
-⸻
-
-🔁 Resilient Retries
-
-All HTTP calls:
-	•	Retry up to 7 attempts on 5xx, 429, and common network errors
-	•	Honor Retry-After for 429
-	•	Retry JSON decode hiccups
-	•	Fail fast on 401 Unauthorized
-
-Tuning tips:
-	•	Large datasets: --size 200..500, --poll-interval 3..5, --poll-timeout 1800..3600
-
-⸻
-
-📄 Output Details
-	•	JSONL – Source of truth; easiest to stream/pipe.
-	•	JSON – Pretty-printed array.
-	•	CSV – Single file; streamed from JSONL, flattened; lists are JSON-encoded strings in cells.
-	•	XLSX – Single workbook; creates additional sheets (findings_01, findings_02, …) when a sheet approaches Excel’s row cap (~1,048,576). This avoids crashes while keeping one file.
-
-⸻
-
-🧰 Post-Run Checks
-
-# Totals consistent
-wc -l ./out/report_all_*.jsonl
-jq 'length' ./out/report_all_*.json
-
-# Provenance fields present
-jq '.[0] | {source_report_id, window_start, window_end}' ./out/report_all_*.json
-
-# Optional duplicate scan (adjust field)
-jq -r '.[].finding_id' ./out/report_all_*.json | sort | uniq -d | head
-
-
-⸻
-
-🛡️ Best Practices
-	•	Use --verify in production to prove full capture
-	•	Prefer CSV for massive flat exports; use XLSX for analyst convenience
-	•	Keep status unset in filters unless you need to narrow scope
-	•	If the API is busy, reduce --size and increase poll interval/timeout
-
-⸻
-
-📸 Sample Console Output
-
-🗂️ === Window 2023-12-22 → 2024-06-18 ===
-  📄 report id: cae52e31-69e6-4994-be8f-20e146c96c71
-  🔄 status: PROCESSING
-  ✅ status: COMPLETED
+	📸 Sample Console Output
+	🗂️ === Window 2023-12-22 → 2024-06-18 ===
+  	📄 report id: cae52e31-69e6-4994-be8f-20e146c96c71
+  	🔄 status: PROCESSING
+  	✅ status: COMPLETED
     📦 page 0: 928 items  ➡️  window_total=0, grand_total=3754
     📦 page 1: 283 items  ➡️  window_total=928, grand_total=4682
     📦 page 2: 1036 items ➡️  window_total=1211, grand_total=4965
     ...
     🧾 running verification …
       ✅ pages: seen=7 reported=7 => OK
-  📊 window complete: 3002 items  (grand_total=6756)
-Outputs:
-  JSONL : out/report_all_20250918_213455.jsonl
-  JSON  : out/report_all_20250918_213455.json
-  CSV   : out/report_all_20250918_213455.csv
-  XLSX  : out/report_all_20250918_213455.xlsx
-📊 Grand total items: 10126
+  	📊 window complete: 3002 items  (grand_total=6756)
+	Outputs:
+ 	 JSONL : out/report_all_20250918_213455.jsonl
+ 	 JSON  : out/report_all_20250918_213455.json
+ 	 CSV   : out/report_all_20250918_213455.csv
+ 	 XLSX  : out/report_all_20250918_213455.xlsx
+	📊 Grand total items: 10126
 
 
-⸻
-Not a VERACODE official tool.
-Utilizing https://docs.veracode.com/r/Reporting_REST_API
+
+
+💡 With this script, you can reliably export Veracode Reporting API data at scale, verify completeness, and get outputs in analyst-friendly formats.
+Not an official VERACODE tool.
+https://docs.veracode.com/r/Reporting_REST_API
