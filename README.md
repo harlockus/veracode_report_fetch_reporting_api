@@ -42,6 +42,8 @@ Production-ready CLI to export **all findings** from the Veracode Reporting REST
 
   If you don’t need Excel, use --no-xlsx.
 
+  Or, recommended, pip install -r requirements.txt
+
   🔐 Authentication
   export VERACODE_API_KEY_ID=YOUR_KEY_ID
   export VERACODE_API_KEY_SECRET=YOUR_KEY_SECRET
